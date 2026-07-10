@@ -3,190 +3,152 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-// Set up JSON and urlencoded body parsers with large limit for handling base64 PDF page renders
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-// Robust JSON extractor for dealing with diverse models (e.g., Claude, GPT)
-function extractJsonFromString(str: string): any {
-  const trimmed = str.trim();
+function extractJsonFromString(value: string): any {
+  const trimmed = value.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "");
   try {
     return JSON.parse(trimmed);
-  } catch (e) {
-    // Attempt to extract the JSON block
-    const firstBrace = trimmed.indexOf('{');
-    const lastBrace = trimmed.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      const candidate = trimmed.substring(firstBrace, lastBrace + 1);
-      try {
-        return JSON.parse(candidate);
-      } catch (innerErr) {
-        // Strip markdown backticks if present
-        const cleaned = candidate.replace(/```json|```/g, "").trim();
-        try {
-          return JSON.parse(cleaned);
-        } catch (deepErr) {
-          throw new Error("Could not parse JSON response from LLM: " + str);
-        }
-      }
+  } catch {
+    const first = trimmed.indexOf("{");
+    const last = trimmed.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      return JSON.parse(trimmed.slice(first, last + 1));
     }
-    throw e;
+    throw new Error("模型没有返回合法 JSON。");
   }
 }
 
+function materialName(key: string) {
+  switch (key) {
+    case "book":
+      return "Book PDF";
+    case "worksheet":
+      return "Worksheet";
+    case "teacherGuide":
+      return "Teacher's Guide";
+    case "readingReport":
+      return "Reading Report";
+    default:
+      return key;
+  }
+}
+
+function buildPrompt(syllabus: any, uploadedFiles: any, promptTemplate: string) {
+  const sections: string[] = [];
+  const uploaded: string[] = [];
+  const notProvided: string[] = [];
+
+  for (const key of ["book", "worksheet", "readingReport", "teacherGuide"]) {
+    const file = uploadedFiles?.[key];
+    const name = materialName(key);
+    if (file?.uploaded) {
+      uploaded.push(name);
+      sections.push(
+        `## ${name}\nFile name: ${file.name || "未命名"}\nPages/Slides: ${file.pagesCount || "未知"}\nText:\n${file.text || "未提取到文本，请按未能充分审核处理。"}`
+      );
+    } else {
+      notProvided.push(name);
+    }
+  }
+
+  return {
+    uploaded,
+    notProvided,
+    text: `${promptTemplate}
+
+[本次审核范围]
+已上传：${uploaded.join(", ") || "无"}
+未上传：${notProvided.join(", ") || "无"}
+
+[S&S 大纲]
+${JSON.stringify(syllabus, null, 2)}
+
+[待审核材料]
+${sections.join("\n\n---\n\n")}
+
+请严格只返回 JSON。`,
+  };
+}
+
 app.post("/api/audit", async (req, res) => {
+  const apiKey = process.env.MODEL_API_KEY;
+  const baseUrl = (process.env.MODEL_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const modelName = process.env.MODEL_NAME || "gpt-4o";
+
   try {
-    const { syllabus, uploadedFiles, promptTemplate } = req.body as {
-      syllabus: any;
-      uploadedFiles: any;
-      promptTemplate: string;
-    };
+    const { syllabus, uploadedFiles, promptTemplate } = req.body || {};
 
     if (!syllabus) {
-      return res.status(400).json({ error: "Syllabus data is required." });
+      return res.status(400).json({ success: false, error: "缺少大纲数据。" });
     }
-
-    if (!uploadedFiles || Object.keys(uploadedFiles).length === 0) {
-      return res.status(400).json({ error: "At least one teaching material must be uploaded." });
+    if (!uploadedFiles) {
+      return res.status(400).json({ success: false, error: "缺少上传材料。" });
     }
-
-    // 1. Check API configurations
-    const apiKey = process.env.MODEL_API_KEY;
-    const baseUrl = process.env.MODEL_BASE_URL || "https://api.openai.com/v1";
-    const modelName = process.env.MODEL_NAME || "gpt-4o";
-
     if (!apiKey) {
-      console.log("[Audit Engine] MODEL_API_KEY is not defined. Failing immediately.");
-      return res.status(401).json({ success: false, error: "后端模型服务未配置，请联系管理员配置环境变量。" });
+      return res.status(401).json({
+        success: false,
+        error: "后端模型服务未配置：请设置 MODEL_API_KEY、MODEL_BASE_URL、MODEL_NAME。",
+      });
     }
 
-    let targetUrl = baseUrl.trim();
-    if (!targetUrl.endsWith("/chat/completions")) {
-      if (targetUrl.endsWith("/")) {
-        targetUrl = targetUrl + "chat/completions";
-      } else {
-        targetUrl = targetUrl + "/chat/completions";
-      }
-    }
+    const { uploaded, notProvided, text } = buildPrompt(syllabus, uploadedFiles, promptTemplate || "");
+    const targetUrl = `${baseUrl}/chat/completions`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 150000);
 
-    // 2. Perform dynamic prompt isolation & variable replacement
-    const uploadedList: string[] = [];
-    const sectionsText: string[] = [];
-    let hasImages = false;
+    console.log(`[Audit Engine] Calling ${modelName} via ${targetUrl}`);
 
-    const getChineseName = (key: string) => {
-      switch (key) {
-        case "book": return "绘本故事内容 (Book PDF)";
-        case "worksheet": return "配套练习 (Worksheet PPT/PDF)";
-        case "teacherGuide": return "教师手册 (Teacher's Guide)";
-        case "readingReport": return "阅读报告 (Reading Report)";
-        default: return key;
-      }
-    };
-
-    Object.keys(uploadedFiles).forEach((key) => {
-      const file = uploadedFiles[key];
-      if (file && file.uploaded) {
-        const title = getChineseName(key);
-        uploadedList.push(`- ${title}`);
-        
-        let sectionDoc = `### 【文档内容】${title}\n`;
-        if (file.text) {
-          sectionDoc += `文本内容：\n${file.text}\n`;
-        } else {
-          sectionDoc += `（文本内容为空或正在使用多模态视觉解析）\n`;
-        }
-        sectionsText.push(sectionDoc);
-
-        if (file.images && Array.isArray(file.images) && file.images.length > 0) {
-          hasImages = true;
-          // [!NOTE] 关于视觉审核：
-          // 当前使用 OpenAI-compatible 的基础文本接口（仅传递 textPrompt）。
-          // 该请求结构不支持图片。如果未来需要支持 PDF/PPT 视觉审核，
-          // 需要确保选用的模型支持多模态（如 gpt-4o, claude-3.5-sonnet 等），
-          // 并将 messages 数组中的 content 改为数组格式：
-          // content: [{ type: "text", text: "..." }, { type: "image_url", image_url: { url: "data:image/jpeg;base64,..." } }]
-        }
-      }
-    });
-
-    let finalPrompt = promptTemplate || "";
-    
-    finalPrompt = finalPrompt.replace(/\{\{Level\}\}/g, syllabus.level || "未指定");
-    finalPrompt = finalPrompt.replace(/\{\{Book Name\}\}/g, syllabus.bookName || "未指定");
-    finalPrompt = finalPrompt.replace(/\{\{Book Number\}\}/g, syllabus.bookNumber || "未指定");
-    finalPrompt = finalPrompt.replace(/\{\{动态生成的已上传文档列表，例如：1. 绘本内容 \(Book PDF\) 2. 配套练习 \(Worksheet\)\}\}/g, uploadedList.join("\n"));
-    
-    if (!uploadedFiles.teacherGuide || !uploadedFiles.teacherGuide.uploaded) {
-      finalPrompt = finalPrompt.replace(/三、Teacher's Guide 审核标准[\s\S]*?四、S&S 大纲一致性/g, "四、S&S 大纲一致性");
-    }
-
-    const textPrompt = `[System Instructions & Task Def]\n${finalPrompt}\n\n[Reference Ground Truth]\nS&S Syllabus Outline:\n${JSON.stringify(syllabus, null, 2)}\n\n[Documents to Audit]\n${sectionsText.join("\n---\n")}\n`;
-
-    console.log(`[Audit Engine] Executing Prompt on model: ${modelName} at ${targetUrl}...`);
-    if (hasImages) {
-      console.log(`[Audit Engine] 注意：用户上传了包含图片的文档，但当前的 OpenAI-compatible 请求格式仅发送了纯文本。视觉审核需要支持多模态的模型和 image_url 请求格式。`);
-    }
-    
     const response = await fetch(targetUrl, {
       method: "POST",
+      signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model: modelName,
-        messages: [
-          {
-            role: "user",
-            content: textPrompt
-          }
-        ],
-        temperature: 0.1
-      })
-    });
-    
+        messages: [{ role: "user", content: text }],
+        temperature: 0.1,
+        max_tokens: 6000,
+      }),
+    }).finally(() => clearTimeout(timeout));
+
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("[Audit Engine] API Error:", errorText);
-      return res.status(response.status).json({ success: false, error: `模型调用失败 (${response.status}): ${errorText}` });
+      return res.status(response.status).json({
+        success: false,
+        error: `模型调用失败 (${response.status})：${errorText}`,
+      });
     }
 
     const responseData = await response.json();
     const responseText = responseData.choices?.[0]?.message?.content || "";
-    
-    let structuredResult;
-    try {
-      structuredResult = extractJsonFromString(responseText || "");
-    } catch (e) {
-      return res.status(500).json({
-        success: false,
-        error: "AI 未按要求输出合法 JSON",
-        rawOutput: responseText
-      });
-    }
+    const structured = extractJsonFromString(responseText);
 
     return res.json({
       success: true,
-      modelUsed: process.env.MODEL_NAME || "未配置模型",
-      scope: structuredResult.scope || { uploadedFiles: [], notProvided: [] },
-      issues: structuredResult.issues || [],
-      excludedSuspicions: structuredResult.excludedSuspicions || []
+      modelUsed: modelName,
+      scope: structured.scope || { uploadedFiles: uploaded, notProvided },
+      issues: Array.isArray(structured.issues) ? structured.issues : [],
+      excludedSuspicions: Array.isArray(structured.excludedSuspicions) ? structured.excludedSuspicions : [],
+      rawOutput: responseText,
     });
-
   } catch (error: any) {
-    console.error("[Audit Engine] API Route Error:", error);
-    return res.status(500).json({ success: false, error: error.message || "服务器处理质检请求时发生未知错误" });
+    const message = error?.name === "AbortError"
+      ? "模型调用超时。请减少上传文本量，或检查 API 网关是否可用。"
+      : error?.message || "服务端处理审核请求失败。";
+    console.error("[Audit Engine] Error:", error);
+    return res.status(500).json({ success: false, error: message });
   }
 });
 
-// Create Vite server in middleware mode for dev, or serve static files in production
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -195,11 +157,10 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Serve static files in production
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
