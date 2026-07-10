@@ -1,0 +1,6 @@
+{
+  "name": "AI 教研内容交叉审核与修改工具",
+  "description": "针对少儿英语分级阅读项目的教学大纲、绘本故事及配套教辅资源，进行智能、多文档逻辑一致性交叉审核，并输出一键复制/导出的去情感化实操修改工单。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
