@@ -65,6 +65,10 @@ function escapeHtml(value: string) {
     .replace(/"/g, "&quot;");
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export default function AuditStage({ syllabus, materials, onAddLog, onClearLogs }: AuditStageProps) {
   const [promptTemplate, setPromptTemplate] = useState(DEFAULT_PROMPT_TEMPLATE);
   const [isPromptOpen, setIsPromptOpen] = useState(false);
@@ -107,13 +111,9 @@ export default function AuditStage({ syllabus, materials, onAddLog, onClearLogs 
     onClearLogs();
     onAddLog("开始提交后端模型服务进行交叉审核。", "info");
 
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 180000);
-
     try {
       const response = await fetch("/api/audit", {
         method: "POST",
-        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           syllabus,
@@ -127,18 +127,49 @@ export default function AuditStage({ syllabus, materials, onAddLog, onClearLogs 
         throw new Error(data.error || `审核接口返回异常：${response.status}`);
       }
 
-      const normalizedIssues = Array.isArray(data.issues)
-        ? data.issues.map((item: any, index: number) => normalizeIssue(item, index))
+      if (!data.jobId) {
+        throw new Error("后端没有返回审核任务编号，请重新部署后再试。");
+      }
+
+      onAddLog("审核任务已创建，正在等待模型返回结果。", "info");
+
+      let dataResult: any = null;
+      for (let attempt = 1; attempt <= 80; attempt += 1) {
+        await sleep(3000);
+        const pollResponse = await fetch(`/api/audit/${encodeURIComponent(data.jobId)}`);
+        const pollData = await pollResponse.json().catch(() => ({}));
+
+        if (pollResponse.ok && pollData.success && pollData.status === "processing") {
+          if (attempt % 5 === 0) {
+            onAddLog(`审核仍在进行中，已等待约 ${attempt * 3} 秒。`, "info");
+          }
+          continue;
+        }
+
+        if (!pollResponse.ok || !pollData.success) {
+          throw new Error(pollData.error || `审核任务返回异常：${pollResponse.status}`);
+        }
+
+        dataResult = pollData;
+        break;
+      }
+
+      if (!dataResult) {
+        throw new Error("审核等待超时：模型处理时间过长，请减少上传文本量或稍后重试。");
+      }
+
+      const normalizedIssues = Array.isArray(dataResult.issues)
+        ? dataResult.issues.map((item: any, index: number) => normalizeIssue(item, index))
         : [];
 
-      setEngineUsed(data.modelUsed || "后端模型");
-      setAuditScope(data.scope || null);
+      setEngineUsed(dataResult.modelUsed || "后端模型");
+      setAuditScope(dataResult.scope || null);
       setIssues(normalizedIssues);
-      setExcludedSuspicions(Array.isArray(data.excludedSuspicions) ? data.excludedSuspicions : []);
+      setExcludedSuspicions(Array.isArray(dataResult.excludedSuspicions) ? dataResult.excludedSuspicions : []);
       setRawOutput(JSON.stringify({
-        scope: data.scope,
-        issues: data.issues,
-        excludedSuspicions: data.excludedSuspicions,
+        scope: dataResult.scope,
+        issues: dataResult.issues,
+        excludedSuspicions: dataResult.excludedSuspicions,
       }, null, 2));
       onAddLog(`审核完成：共生成 ${normalizedIssues.length} 条正式问题。`, "success");
     } catch (error: any) {
@@ -148,7 +179,6 @@ export default function AuditStage({ syllabus, materials, onAddLog, onClearLogs 
       setErrorMessage(message);
       onAddLog(`审核失败：${message}`, "error");
     } finally {
-      window.clearTimeout(timeout);
       setIsProcessing(false);
     }
   };

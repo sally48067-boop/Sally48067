@@ -7,6 +7,7 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const auditJobs = new Map<string, any>();
 
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -77,25 +78,22 @@ ${sections.join("\n\n---\n\n")}
   };
 }
 
-app.post("/api/audit", async (req, res) => {
+async function runAuditJob(jobId: string, payload: any) {
   const apiKey = process.env.MODEL_API_KEY;
   const baseUrl = (process.env.MODEL_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
   const modelName = process.env.MODEL_NAME || "gpt-4o";
 
   try {
-    const { syllabus, uploadedFiles, promptTemplate } = req.body || {};
+    const { syllabus, uploadedFiles, promptTemplate } = payload || {};
 
     if (!syllabus) {
-      return res.status(400).json({ success: false, error: "缺少大纲数据。" });
+      throw new Error("缺少大纲数据。");
     }
     if (!uploadedFiles) {
-      return res.status(400).json({ success: false, error: "缺少上传材料。" });
+      throw new Error("缺少上传材料。");
     }
     if (!apiKey) {
-      return res.status(401).json({
-        success: false,
-        error: "后端模型服务未配置：请设置 MODEL_API_KEY、MODEL_BASE_URL、MODEL_NAME。",
-      });
+      throw new Error("后端模型服务未配置：请设置 MODEL_API_KEY、MODEL_BASE_URL、MODEL_NAME。");
     }
 
     const { uploaded, notProvided, text } = buildPrompt(syllabus, uploadedFiles, promptTemplate || "");
@@ -122,31 +120,64 @@ app.post("/api/audit", async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
-      return res.status(response.status).json({
-        success: false,
-        error: `模型调用失败 (${response.status})：${errorText}`,
-      });
+      throw new Error(`模型调用失败 (${response.status})：${errorText}`);
     }
 
     const responseData = await response.json();
     const responseText = responseData.choices?.[0]?.message?.content || "";
     const structured = extractJsonFromString(responseText);
 
-    return res.json({
-      success: true,
-      modelUsed: modelName,
-      scope: structured.scope || { uploadedFiles: uploaded, notProvided },
-      issues: Array.isArray(structured.issues) ? structured.issues : [],
-      excludedSuspicions: Array.isArray(structured.excludedSuspicions) ? structured.excludedSuspicions : [],
-      rawOutput: responseText,
+    auditJobs.set(jobId, {
+      status: "completed",
+      updatedAt: Date.now(),
+      result: {
+        success: true,
+        modelUsed: modelName,
+        scope: structured.scope || { uploadedFiles: uploaded, notProvided },
+        issues: Array.isArray(structured.issues) ? structured.issues : [],
+        excludedSuspicions: Array.isArray(structured.excludedSuspicions) ? structured.excludedSuspicions : [],
+        rawOutput: responseText,
+      },
     });
   } catch (error: any) {
     const message = error?.name === "AbortError"
       ? "模型调用超时。请减少上传文本量，或检查 API 网关是否可用。"
       : error?.message || "服务端处理审核请求失败。";
     console.error("[Audit Engine] Error:", error);
-    return res.status(500).json({ success: false, error: message });
+    auditJobs.set(jobId, {
+      status: "failed",
+      updatedAt: Date.now(),
+      error: message,
+    });
   }
+}
+
+app.post("/api/audit", async (req, res) => {
+  const jobId = `audit-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  auditJobs.set(jobId, { status: "processing", createdAt: Date.now(), updatedAt: Date.now() });
+  runAuditJob(jobId, req.body).catch((error) => {
+    console.error("[Audit Engine] Unexpected job error:", error);
+    auditJobs.set(jobId, {
+      status: "failed",
+      updatedAt: Date.now(),
+      error: error?.message || "后台审核任务失败。",
+    });
+  });
+  return res.json({ success: true, jobId });
+});
+
+app.get("/api/audit/:jobId", (req, res) => {
+  const job = auditJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, error: "未找到审核任务，请重新开始审核。" });
+  }
+  if (job.status === "completed") {
+    return res.json(job.result);
+  }
+  if (job.status === "failed") {
+    return res.status(500).json({ success: false, error: job.error || "后台审核任务失败。" });
+  }
+  return res.json({ success: true, status: "processing" });
 });
 
 async function startServer() {
