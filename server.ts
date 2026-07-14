@@ -26,6 +26,51 @@ function extractJsonFromString(value: string): any {
   }
 }
 
+async function repairJsonOutput(params: {
+  targetUrl: string;
+  apiKey: string;
+  modelName: string;
+  responseText: string;
+  parseError: string;
+}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  const repairPrompt = `下面是一段模型输出，原本应该是合法 JSON，但解析失败。
+
+解析错误：
+${params.parseError}
+
+请只修复 JSON 语法，不要新增问题、删除问题、改写问题含义，也不要输出 Markdown。
+必须返回一个合法 JSON 对象，包含 scope、issues、excludedSuspicions 三个字段。
+
+待修复内容：
+${params.responseText}`;
+
+  const repairResponse = await fetch(params.targetUrl, {
+    method: "POST",
+    signal: controller.signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${params.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: params.modelName,
+      messages: [{ role: "user", content: repairPrompt }],
+      temperature: 0,
+      max_tokens: 7000,
+    }),
+  }).finally(() => clearTimeout(timeout));
+
+  if (!repairResponse.ok) {
+    const errorText = await repairResponse.text();
+    throw new Error(`模型返回的 JSON 无法解析，且自动修复失败 (${repairResponse.status})：${errorText}`);
+  }
+
+  const repairData = await repairResponse.json();
+  return repairData.choices?.[0]?.message?.content || "";
+}
+
 function materialName(key: string) {
   switch (key) {
     case "book":
@@ -125,7 +170,21 @@ async function runAuditJob(jobId: string, payload: any) {
 
     const responseData = await response.json();
     const responseText = responseData.choices?.[0]?.message?.content || "";
-    const structured = extractJsonFromString(responseText);
+    let structured: any;
+
+    try {
+      structured = extractJsonFromString(responseText);
+    } catch (parseError: any) {
+      console.warn("[Audit Engine] JSON parse failed, attempting repair:", parseError?.message || parseError);
+      const repairedText = await repairJsonOutput({
+        targetUrl,
+        apiKey,
+        modelName,
+        responseText,
+        parseError: parseError?.message || "JSON parse failed",
+      });
+      structured = extractJsonFromString(repairedText);
+    }
 
     auditJobs.set(jobId, {
       status: "completed",
